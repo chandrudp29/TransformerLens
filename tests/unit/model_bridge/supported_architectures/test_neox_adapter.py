@@ -128,9 +128,9 @@ class TestNeoxAdapterComponentMapping:
         assert set(blocks.submodules.keys()) == {"ln1", "ln2", "attn", "mlp"}
 
     def test_attention_submodule_keys(self, adapter: NeoxArchitectureAdapter) -> None:
-        """NeoX uses a combined QKV projection."""
+        """NeoX uses a combined QKV projection alongside derived q/k/v split bridges."""
         attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert set(attn.submodules.keys()) == {"qkv", "o"}
+        assert set(attn.submodules.keys()) == {"qkv", "q", "k", "v", "o"}
 
     def test_mlp_submodule_keys(self, adapter: NeoxArchitectureAdapter) -> None:
         mlp = adapter.component_mapping["blocks"].submodules["mlp"]
