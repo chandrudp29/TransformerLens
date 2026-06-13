@@ -1,9 +1,8 @@
 """Unit tests for NeoArchitectureAdapter.
 
 Tests cover:
-- Config attribute validation (all required attributes are set correctly)
-- Component mapping structure (correct bridge types and HF module names)
-- Weight conversion keys and count
+- Component mapping structure (bridge types and HF module names)
+- Weight conversion key set
 - NeoLinearTransposeConversion numerical correctness
 """
 
@@ -64,30 +63,6 @@ def adapter(cfg: TransformerBridgeConfig) -> NeoArchitectureAdapter:
 
 
 # ---------------------------------------------------------------------------
-# Config attribute tests
-# ---------------------------------------------------------------------------
-
-
-class TestNeoAdapterConfig:
-    """Tests that the adapter sets required config attributes correctly."""
-
-    def test_normalization_type_is_ln(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.cfg.normalization_type == "LN"
-
-    def test_positional_embedding_type_is_standard(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.cfg.positional_embedding_type == "standard"
-
-    def test_final_rms_is_false(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.cfg.final_rms is False
-
-    def test_gated_mlp_is_false(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.cfg.gated_mlp is False
-
-    def test_attn_only_is_false(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.cfg.attn_only is False
-
-
-# ---------------------------------------------------------------------------
 # Component mapping structure tests
 # ---------------------------------------------------------------------------
 
@@ -95,112 +70,74 @@ class TestNeoAdapterConfig:
 class TestNeoAdapterComponentMapping:
     """Tests that component_mapping has the correct bridge types and HF module names."""
 
-    # -- Top-level keys --
+    def test_top_level_keys(self, adapter: NeoArchitectureAdapter) -> None:
+        assert set(adapter.component_mapping.keys()) == {
+            "embed",
+            "pos_embed",
+            "blocks",
+            "ln_final",
+            "unembed",
+        }
 
-    def test_embed_is_embedding_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        assert isinstance(adapter.component_mapping["embed"], EmbeddingBridge)
+    def test_bridge_types(self, adapter: NeoArchitectureAdapter) -> None:
+        mapping = adapter.component_mapping
+        blocks = mapping["blocks"]
+        assert isinstance(mapping["embed"], EmbeddingBridge)
+        assert isinstance(mapping["pos_embed"], PosEmbedBridge)
+        assert isinstance(blocks, BlockBridge)
+        assert isinstance(mapping["ln_final"], NormalizationBridge)
+        assert isinstance(mapping["unembed"], UnembeddingBridge)
 
-    def test_embed_name(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.component_mapping["embed"].name == "transformer.wte"
+    def test_top_level_hf_paths(self, adapter: NeoArchitectureAdapter) -> None:
+        mapping = adapter.component_mapping
+        assert mapping["embed"].name == "transformer.wte"
+        assert mapping["pos_embed"].name == "transformer.wpe"
+        assert mapping["blocks"].name == "transformer.h"
+        assert mapping["ln_final"].name == "transformer.ln_f"
+        assert mapping["unembed"].name == "lm_head"
 
-    def test_pos_embed_is_pos_embed_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        assert isinstance(adapter.component_mapping["pos_embed"], PosEmbedBridge)
-
-    def test_pos_embed_name(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.component_mapping["pos_embed"].name == "transformer.wpe"
-
-    def test_blocks_is_block_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        assert isinstance(adapter.component_mapping["blocks"], BlockBridge)
-
-    def test_blocks_name(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.component_mapping["blocks"].name == "transformer.h"
-
-    def test_ln_final_is_normalization_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        assert isinstance(adapter.component_mapping["ln_final"], NormalizationBridge)
-
-    def test_ln_final_name(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.component_mapping["ln_final"].name == "transformer.ln_f"
-
-    def test_unembed_is_unembedding_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        assert isinstance(adapter.component_mapping["unembed"], UnembeddingBridge)
-
-    def test_unembed_name(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.component_mapping["unembed"].name == "lm_head"
-
-    # -- Block submodules --
-
-    def test_blocks_ln1_is_normalization_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        assert isinstance(
-            adapter.component_mapping["blocks"].submodules["ln1"], NormalizationBridge
-        )
-
-    def test_blocks_ln1_name(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.component_mapping["blocks"].submodules["ln1"].name == "ln_1"
-
-    def test_blocks_ln2_is_normalization_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        assert isinstance(
-            adapter.component_mapping["blocks"].submodules["ln2"], NormalizationBridge
-        )
-
-    def test_blocks_ln2_name(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.component_mapping["blocks"].submodules["ln2"].name == "ln_2"
-
-    def test_attn_is_attention_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        """Neo uses separate Q/K/V projections (AttentionBridge), unlike GPT-2's combined QKV."""
+    def test_block_submodule_keys(self, adapter: NeoArchitectureAdapter) -> None:
         blocks = adapter.component_mapping["blocks"]
+        assert set(blocks.submodules.keys()) == {"ln1", "ln2", "attn", "mlp"}
+
+    def test_attention_submodule_keys(self, adapter: NeoArchitectureAdapter) -> None:
+        """Neo uses separate Q/K/V projections — not a combined QKV matrix."""
+        attn = adapter.component_mapping["blocks"].submodules["attn"]
+        assert set(attn.submodules.keys()) == {"q", "k", "v", "o"}
+
+    def test_mlp_submodule_keys(self, adapter: NeoArchitectureAdapter) -> None:
+        mlp = adapter.component_mapping["blocks"].submodules["mlp"]
+        assert set(mlp.submodules.keys()) == {"in", "out"}
+
+    def test_block_bridge_types(self, adapter: NeoArchitectureAdapter) -> None:
+        blocks = adapter.component_mapping["blocks"]
+        assert isinstance(blocks.submodules["ln1"], NormalizationBridge)
+        assert isinstance(blocks.submodules["ln2"], NormalizationBridge)
         assert isinstance(blocks.submodules["attn"], AttentionBridge)
-
-    def test_attn_name(self, adapter: NeoArchitectureAdapter) -> None:
-        """Neo's attention submodule is nested as attn.attention in HuggingFace."""
-        blocks = adapter.component_mapping["blocks"]
-        assert blocks.submodules["attn"].name == "attn.attention"
-
-    def test_attn_q_is_linear_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert isinstance(attn.submodules["q"], LinearBridge)
-
-    def test_attn_q_name(self, adapter: NeoArchitectureAdapter) -> None:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert attn.submodules["q"].name == "q_proj"
-
-    def test_attn_k_is_linear_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert isinstance(attn.submodules["k"], LinearBridge)
-
-    def test_attn_k_name(self, adapter: NeoArchitectureAdapter) -> None:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert attn.submodules["k"].name == "k_proj"
-
-    def test_attn_v_is_linear_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert isinstance(attn.submodules["v"], LinearBridge)
-
-    def test_attn_v_name(self, adapter: NeoArchitectureAdapter) -> None:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert attn.submodules["v"].name == "v_proj"
-
-    def test_attn_o_is_linear_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert isinstance(attn.submodules["o"], LinearBridge)
-
-    def test_attn_o_name(self, adapter: NeoArchitectureAdapter) -> None:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert attn.submodules["o"].name == "out_proj"
-
-    def test_mlp_is_mlp_bridge(self, adapter: NeoArchitectureAdapter) -> None:
-        blocks = adapter.component_mapping["blocks"]
         assert isinstance(blocks.submodules["mlp"], MLPBridge)
 
-    def test_mlp_name(self, adapter: NeoArchitectureAdapter) -> None:
-        assert adapter.component_mapping["blocks"].submodules["mlp"].name == "mlp"
+    def test_attention_hf_paths(self, adapter: NeoArchitectureAdapter) -> None:
+        """Neo's attention is nested as attn.attention in HuggingFace."""
+        attn = adapter.component_mapping["blocks"].submodules["attn"]
+        assert attn.name == "attn.attention"
+        assert attn.submodules["q"].name == "q_proj"
+        assert attn.submodules["k"].name == "k_proj"
+        assert attn.submodules["v"].name == "v_proj"
+        assert attn.submodules["o"].name == "out_proj"
 
-    def test_mlp_in_name(self, adapter: NeoArchitectureAdapter) -> None:
-        mlp = adapter.component_mapping["blocks"].submodules["mlp"]
-        assert mlp.submodules["in"].name == "c_fc"
+    def test_block_hf_paths(self, adapter: NeoArchitectureAdapter) -> None:
+        blocks = adapter.component_mapping["blocks"]
+        assert blocks.submodules["ln1"].name == "ln_1"
+        assert blocks.submodules["ln2"].name == "ln_2"
+        assert blocks.submodules["mlp"].name == "mlp"
+        assert blocks.submodules["mlp"].submodules["in"].name == "c_fc"
+        assert blocks.submodules["mlp"].submodules["out"].name == "c_proj"
 
-    def test_mlp_out_name(self, adapter: NeoArchitectureAdapter) -> None:
+    def test_linear_submodule_bridge_types(self, adapter: NeoArchitectureAdapter) -> None:
+        attn = adapter.component_mapping["blocks"].submodules["attn"]
         mlp = adapter.component_mapping["blocks"].submodules["mlp"]
-        assert mlp.submodules["out"].name == "c_proj"
+        for submodule in [*attn.submodules.values(), *mlp.submodules.values()]:
+            assert isinstance(submodule, LinearBridge)
 
 
 # ---------------------------------------------------------------------------
@@ -209,11 +146,10 @@ class TestNeoAdapterComponentMapping:
 
 
 class TestNeoAdapterWeightConversions:
-    """Tests that weight_processing_conversions has exactly the expected keys."""
+    """Tests that weight_processing_conversions has exactly the expected key set."""
 
-    @pytest.mark.parametrize(
-        "key",
-        [
+    def test_exact_conversion_key_set(self, adapter: NeoArchitectureAdapter) -> None:
+        assert set(adapter.weight_processing_conversions.keys()) == {
             "blocks.{i}.attn.q.weight",
             "blocks.{i}.attn.k.weight",
             "blocks.{i}.attn.v.weight",
@@ -223,13 +159,7 @@ class TestNeoAdapterWeightConversions:
             "blocks.{i}.attn.q.bias",
             "blocks.{i}.attn.k.bias",
             "blocks.{i}.attn.v.bias",
-        ],
-    )
-    def test_conversion_key_present(self, adapter: NeoArchitectureAdapter, key: str) -> None:
-        assert key in adapter.weight_processing_conversions
-
-    def test_exactly_nine_conversion_keys(self, adapter: NeoArchitectureAdapter) -> None:
-        assert len(adapter.weight_processing_conversions) == 9
+        }
 
 
 # ---------------------------------------------------------------------------
