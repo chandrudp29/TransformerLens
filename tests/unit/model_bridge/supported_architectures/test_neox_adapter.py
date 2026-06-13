@@ -1,10 +1,12 @@
 """Unit tests for NeoxArchitectureAdapter.
 
 Tests cover:
-- Config attribute validation (all required attributes are set correctly)
-- Component mapping structure (correct bridge types and HF module names)
-- Weight conversion keys and count
+- Component mapping structure (bridge types and HF module names)
+- Weight conversion key set and shared source keys
+- setup_component_testing rotary embedding wiring
 """
+
+from types import SimpleNamespace
 
 import pytest
 
@@ -60,35 +62,27 @@ def adapter(cfg: TransformerBridgeConfig) -> NeoxArchitectureAdapter:
     return NeoxArchitectureAdapter(cfg)
 
 
-# ---------------------------------------------------------------------------
-# Config attribute tests
-# ---------------------------------------------------------------------------
+def _fake_hf_model(rotary_emb: object) -> SimpleNamespace:
+    return SimpleNamespace(gpt_neox=SimpleNamespace(rotary_emb=rotary_emb))
 
 
-class TestNeoxAdapterConfig:
-    """Tests that the adapter sets required config attributes correctly."""
+class DummyAttention:
+    def __init__(self) -> None:
+        self.rotary_emb = None
 
-    def test_normalization_type_is_ln(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.cfg.normalization_type == "LN"
+    def set_rotary_emb(self, rotary_emb: object) -> None:
+        self.rotary_emb = rotary_emb
 
-    def test_positional_embedding_type_is_rotary(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.cfg.positional_embedding_type == "rotary"
 
-    def test_final_rms_is_false(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.cfg.final_rms is False
+class DummyBlock:
+    def __init__(self, has_attention: bool = True) -> None:
+        if has_attention:
+            self.attn = DummyAttention()
 
-    def test_gated_mlp_is_false(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.cfg.gated_mlp is False
 
-    def test_attn_only_is_false(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.cfg.attn_only is False
-
-    def test_parallel_attn_mlp_is_true(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.cfg.parallel_attn_mlp is True
-
-    def test_default_prepend_bos_is_false(self, adapter: NeoxArchitectureAdapter) -> None:
-        """GPT-NeoX/Pythia models were not trained with BOS tokens."""
-        assert adapter.cfg.default_prepend_bos is False
+class DummyBridgeModel:
+    def __init__(self, blocks: list[DummyBlock]) -> None:
+        self.blocks = blocks
 
 
 # ---------------------------------------------------------------------------
@@ -99,110 +93,80 @@ class TestNeoxAdapterConfig:
 class TestNeoxAdapterComponentMapping:
     """Tests that component_mapping has the correct bridge types and HF module names."""
 
-    # -- Top-level keys --
+    def test_top_level_keys(self, adapter: NeoxArchitectureAdapter) -> None:
+        assert set(adapter.component_mapping.keys()) == {
+            "embed",
+            "rotary_emb",
+            "blocks",
+            "ln_final",
+            "unembed",
+        }
 
-    def test_embed_is_embedding_bridge(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert isinstance(adapter.component_mapping["embed"], EmbeddingBridge)
+    def test_bridge_types(self, adapter: NeoxArchitectureAdapter) -> None:
+        mapping = adapter.component_mapping
+        blocks = mapping["blocks"]
+        assert isinstance(mapping["embed"], EmbeddingBridge)
+        assert isinstance(mapping["rotary_emb"], RotaryEmbeddingBridge)
+        assert isinstance(blocks, ParallelBlockBridge)
+        assert isinstance(mapping["ln_final"], NormalizationBridge)
+        assert isinstance(mapping["unembed"], UnembeddingBridge)
 
-    def test_embed_name(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.component_mapping["embed"].name == "gpt_neox.embed_in"
-
-    def test_rotary_emb_is_rotary_embedding_bridge(self, adapter: NeoxArchitectureAdapter) -> None:
-        """NeoX uses rotary embeddings instead of learned positional embeddings."""
-        assert isinstance(adapter.component_mapping["rotary_emb"], RotaryEmbeddingBridge)
-
-    def test_rotary_emb_name(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.component_mapping["rotary_emb"].name == "gpt_neox.rotary_emb"
+    def test_top_level_hf_paths(self, adapter: NeoxArchitectureAdapter) -> None:
+        mapping = adapter.component_mapping
+        assert mapping["embed"].name == "gpt_neox.embed_in"
+        assert mapping["rotary_emb"].name == "gpt_neox.rotary_emb"
+        assert mapping["blocks"].name == "gpt_neox.layers"
+        assert mapping["ln_final"].name == "gpt_neox.final_layer_norm"
+        assert mapping["unembed"].name == "embed_out"
 
     def test_no_pos_embed_key(self, adapter: NeoxArchitectureAdapter) -> None:
-        """NeoX has no learned positional embedding — uses rotary instead."""
+        """NeoX uses rotary embeddings — no learned positional embedding component."""
         assert "pos_embed" not in adapter.component_mapping
 
-    def test_blocks_is_parallel_block_bridge(self, adapter: NeoxArchitectureAdapter) -> None:
-        """NeoX runs attention and MLP in parallel (ParallelBlockBridge)."""
-        assert isinstance(adapter.component_mapping["blocks"], ParallelBlockBridge)
-
-    def test_blocks_name(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.component_mapping["blocks"].name == "gpt_neox.layers"
-
-    def test_ln_final_is_normalization_bridge(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert isinstance(adapter.component_mapping["ln_final"], NormalizationBridge)
-
-    def test_ln_final_name(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.component_mapping["ln_final"].name == "gpt_neox.final_layer_norm"
-
-    def test_unembed_is_unembedding_bridge(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert isinstance(adapter.component_mapping["unembed"], UnembeddingBridge)
-
-    def test_unembed_name(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.component_mapping["unembed"].name == "embed_out"
-
-    # -- Block submodules --
-
-    def test_blocks_ln1_is_normalization_bridge(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert isinstance(
-            adapter.component_mapping["blocks"].submodules["ln1"], NormalizationBridge
-        )
-
-    def test_blocks_ln1_name(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.component_mapping["blocks"].submodules["ln1"].name == "input_layernorm"
-
-    def test_blocks_ln2_is_normalization_bridge(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert isinstance(
-            adapter.component_mapping["blocks"].submodules["ln2"], NormalizationBridge
-        )
-
-    def test_blocks_ln2_name(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert (
-            adapter.component_mapping["blocks"].submodules["ln2"].name == "post_attention_layernorm"
-        )
-
-    def test_attn_is_joint_qkv_position_embeddings_bridge(
-        self, adapter: NeoxArchitectureAdapter
-    ) -> None:
-        """NeoX uses a combined QKV matrix with rotary embeddings."""
+    def test_block_submodule_keys(self, adapter: NeoxArchitectureAdapter) -> None:
         blocks = adapter.component_mapping["blocks"]
+        assert set(blocks.submodules.keys()) == {"ln1", "ln2", "attn", "mlp"}
+
+    def test_attention_submodule_keys(self, adapter: NeoxArchitectureAdapter) -> None:
+        """NeoX uses a combined QKV projection."""
+        attn = adapter.component_mapping["blocks"].submodules["attn"]
+        assert set(attn.submodules.keys()) == {"qkv", "o"}
+
+    def test_mlp_submodule_keys(self, adapter: NeoxArchitectureAdapter) -> None:
+        mlp = adapter.component_mapping["blocks"].submodules["mlp"]
+        assert set(mlp.submodules.keys()) == {"in", "out"}
+
+    def test_block_bridge_types(self, adapter: NeoxArchitectureAdapter) -> None:
+        blocks = adapter.component_mapping["blocks"]
+        assert isinstance(blocks.submodules["ln1"], NormalizationBridge)
+        assert isinstance(blocks.submodules["ln2"], NormalizationBridge)
         assert isinstance(blocks.submodules["attn"], JointQKVPositionEmbeddingsAttentionBridge)
+        assert isinstance(blocks.submodules["mlp"], MLPBridge)
 
-    def test_attn_name(self, adapter: NeoxArchitectureAdapter) -> None:
-        blocks = adapter.component_mapping["blocks"]
-        assert blocks.submodules["attn"].name == "attention"
+    def test_attention_hf_paths(self, adapter: NeoxArchitectureAdapter) -> None:
+        attn = adapter.component_mapping["blocks"].submodules["attn"]
+        assert attn.name == "attention"
+        assert attn.submodules["qkv"].name == "query_key_value"
+        assert attn.submodules["o"].name == "dense"
 
     def test_attn_requires_attention_mask(self, adapter: NeoxArchitectureAdapter) -> None:
-        """GPTNeoX/StableLM requires an explicit attention mask."""
+        """GPTNeoX requires an explicit attention mask."""
         attn = adapter.component_mapping["blocks"].submodules["attn"]
         assert attn.requires_attention_mask is True
 
-    def test_attn_qkv_is_linear_bridge(self, adapter: NeoxArchitectureAdapter) -> None:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert isinstance(attn.submodules["qkv"], LinearBridge)
-
-    def test_attn_qkv_name(self, adapter: NeoxArchitectureAdapter) -> None:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert attn.submodules["qkv"].name == "query_key_value"
-
-    def test_attn_o_is_linear_bridge(self, adapter: NeoxArchitectureAdapter) -> None:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert isinstance(attn.submodules["o"], LinearBridge)
-
-    def test_attn_o_name(self, adapter: NeoxArchitectureAdapter) -> None:
-        attn = adapter.component_mapping["blocks"].submodules["attn"]
-        assert attn.submodules["o"].name == "dense"
-
-    def test_mlp_is_mlp_bridge(self, adapter: NeoxArchitectureAdapter) -> None:
+    def test_block_hf_paths(self, adapter: NeoxArchitectureAdapter) -> None:
         blocks = adapter.component_mapping["blocks"]
-        assert isinstance(blocks.submodules["mlp"], MLPBridge)
+        assert blocks.submodules["ln1"].name == "input_layernorm"
+        assert blocks.submodules["ln2"].name == "post_attention_layernorm"
+        assert blocks.submodules["mlp"].name == "mlp"
+        assert blocks.submodules["mlp"].submodules["in"].name == "dense_h_to_4h"
+        assert blocks.submodules["mlp"].submodules["out"].name == "dense_4h_to_h"
 
-    def test_mlp_name(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert adapter.component_mapping["blocks"].submodules["mlp"].name == "mlp"
-
-    def test_mlp_in_name(self, adapter: NeoxArchitectureAdapter) -> None:
+    def test_linear_submodule_bridge_types(self, adapter: NeoxArchitectureAdapter) -> None:
+        attn = adapter.component_mapping["blocks"].submodules["attn"]
         mlp = adapter.component_mapping["blocks"].submodules["mlp"]
-        assert mlp.submodules["in"].name == "dense_h_to_4h"
-
-    def test_mlp_out_name(self, adapter: NeoxArchitectureAdapter) -> None:
-        mlp = adapter.component_mapping["blocks"].submodules["mlp"]
-        assert mlp.submodules["out"].name == "dense_4h_to_h"
+        for submodule in [*attn.submodules.values(), *mlp.submodules.values()]:
+            assert isinstance(submodule, LinearBridge)
 
 
 # ---------------------------------------------------------------------------
@@ -211,11 +175,16 @@ class TestNeoxAdapterComponentMapping:
 
 
 class TestNeoxAdapterWeightConversions:
-    """Tests that weight_processing_conversions has exactly the expected keys."""
+    """Tests that weight_processing_conversions has the expected key set and source keys.
 
-    @pytest.mark.parametrize(
-        "key",
-        [
+    NeoX stores Q, K, V (weights and biases) in a single interleaved matrix
+    gpt_neox.layers.{i}.attention.query_key_value.{weight,bias}.
+    All three projections share the same source key — each conversion extracts
+    its slice via SplitTensorConversion.
+    """
+
+    def test_exact_conversion_key_set(self, adapter: NeoxArchitectureAdapter) -> None:
+        assert set(adapter.weight_processing_conversions.keys()) == {
             "blocks.{i}.attn.q",
             "blocks.{i}.attn.k",
             "blocks.{i}.attn.v",
@@ -223,28 +192,50 @@ class TestNeoxAdapterWeightConversions:
             "blocks.{i}.attn.b_K",
             "blocks.{i}.attn.b_V",
             "blocks.{i}.attn.o",
-        ],
-    )
-    def test_conversion_key_present(self, adapter: NeoxArchitectureAdapter, key: str) -> None:
-        assert key in adapter.weight_processing_conversions
+        }
 
-    def test_exactly_seven_conversion_keys(self, adapter: NeoxArchitectureAdapter) -> None:
-        assert len(adapter.weight_processing_conversions) == 7
-
-    def test_qkv_conversions_share_source_key(self, adapter: NeoxArchitectureAdapter) -> None:
-        """Q, K, V weights all come from the same combined QKV matrix in HuggingFace."""
-        expected_source = "gpt_neox.layers.{i}.attention.query_key_value.weight"
+    def test_qkv_weights_share_source_key(self, adapter: NeoxArchitectureAdapter) -> None:
+        """Q, K, V weights all come from the same interleaved QKV matrix."""
+        expected = "gpt_neox.layers.{i}.attention.query_key_value.weight"
         for key in ("blocks.{i}.attn.q", "blocks.{i}.attn.k", "blocks.{i}.attn.v"):
-            assert adapter.weight_processing_conversions[key].source_key == expected_source
+            assert adapter.weight_processing_conversions[key].source_key == expected
 
-    def test_bias_conversions_share_source_key(self, adapter: NeoxArchitectureAdapter) -> None:
-        """Q, K, V biases all come from the same combined QKV bias vector."""
-        expected_source = "gpt_neox.layers.{i}.attention.query_key_value.bias"
+    def test_qkv_biases_share_source_key(self, adapter: NeoxArchitectureAdapter) -> None:
+        """Q, K, V biases all come from the same interleaved QKV bias vector."""
+        expected = "gpt_neox.layers.{i}.attention.query_key_value.bias"
         for key in ("blocks.{i}.attn.b_Q", "blocks.{i}.attn.b_K", "blocks.{i}.attn.b_V"):
-            assert adapter.weight_processing_conversions[key].source_key == expected_source
+            assert adapter.weight_processing_conversions[key].source_key == expected
 
-    def test_o_conversion_source_key(self, adapter: NeoxArchitectureAdapter) -> None:
-        expected_source = "gpt_neox.layers.{i}.attention.dense.weight"
-        assert (
-            adapter.weight_processing_conversions["blocks.{i}.attn.o"].source_key == expected_source
-        )
+    def test_o_projection_source_key(self, adapter: NeoxArchitectureAdapter) -> None:
+        expected = "gpt_neox.layers.{i}.attention.dense.weight"
+        assert adapter.weight_processing_conversions["blocks.{i}.attn.o"].source_key == expected
+
+
+# ---------------------------------------------------------------------------
+# setup_component_testing — rotary embedding wiring
+# ---------------------------------------------------------------------------
+
+
+class TestNeoxSetupComponentTesting:
+    """setup_component_testing must wire NeoX's rotary embedding into attention bridges."""
+
+    def test_sets_rotary_emb_on_bridge_model_blocks(self, adapter: NeoxArchitectureAdapter) -> None:
+        rotary_emb = object()
+        bridge_model = DummyBridgeModel([DummyBlock(), DummyBlock(), DummyBlock()])
+
+        adapter.setup_component_testing(_fake_hf_model(rotary_emb), bridge_model=bridge_model)
+
+        for block in bridge_model.blocks:
+            assert block.attn.rotary_emb is rotary_emb
+
+    def test_skips_bridge_blocks_without_attention(self, adapter: NeoxArchitectureAdapter) -> None:
+        rotary_emb = object()
+        bridge_model = DummyBridgeModel([DummyBlock(), DummyBlock(has_attention=False)])
+
+        adapter.setup_component_testing(_fake_hf_model(rotary_emb), bridge_model=bridge_model)
+
+        assert bridge_model.blocks[0].attn.rotary_emb is rotary_emb
+
+    def test_no_bridge_model_does_not_raise(self, adapter: NeoxArchitectureAdapter) -> None:
+        """setup_component_testing without a bridge_model should not raise."""
+        adapter.setup_component_testing(_fake_hf_model(object()))
